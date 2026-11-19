@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Antigravity"
+  short_description: "Delegate tasks to Gemini through the Antigravity CLI"
+  default_prompt: "Use $delegate-to-antigravity to carry out this task with Antigravity, continue with feedback as needed, and verify the result."
