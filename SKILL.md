@@ -62,7 +62,10 @@ calls:
   `action(target)` form and match by prefix. Allow only what the task needs;
   never allow every command.
 - Every call runs in agy's terminal sandbox: commands can write only the
-  workspace and temporary directories and have no network access. On macOS,
+  workspace and temporary directories and reach only the network hosts granted
+  for the call. `--allow 'read_url(pypi.org)'` adds a domain and its
+  subdomains to the sandbox's outbound allowlist; grant only the hosts the
+  task needs. On macOS,
   Apple's `/usr/bin` stand-ins for developer tools (`git`, `python3`) fail in
   the sandbox with an `xcode-select` error; name a full Homebrew or virtual
   environment path instead.
