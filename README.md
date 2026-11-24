@@ -2,7 +2,7 @@
 
 A skill for Claude Code and Codex that hands a task to Google's Antigravity agent through the Antigravity CLI (`agy`), reviews the result, and sends feedback to the same Antigravity conversation. Give Antigravity a project directory, the access it may use, and the checks it should run. The calling agent can then inspect the changes and verify the result.
 
-The skill calls the `agy` executable and uses its existing Google sign-in and Antigravity plan. It replaces Gemini CLI, which stopped serving personal Google accounts, including Google AI Pro and Ultra, on 18 June 2026.
+The skill calls the `agy` executable and uses its existing Google sign-in and Antigravity plan. It can also use Gemini API keys from Google AI Studio, in an order you choose, after the plan runs out. It replaces Gemini CLI, which stopped serving personal Google accounts, including Google AI Pro and Ultra, on 18 June 2026.
 
 For the other directions, see [delegate-to-codex](https://github.com/Yiming-M/delegate-to-codex) and [delegate-to-claude](https://github.com/Yiming-M/delegate-to-claude).
 
@@ -25,7 +25,7 @@ You'll need Claude Code or Codex, Python 3.10 or later, and the [Antigravity CLI
    # Codex
    # skill_dir="$HOME/.agents/skills/delegate-to-antigravity"
    mkdir -p "$skill_dir"
-   cp -R SKILL.md agents scripts "$skill_dir/"
+   cp -R SKILL.md agents scripts references examples "$skill_dir/"
    ```
 
 3. Ask for Gemini in plain words, with a request such as this one.
@@ -59,6 +59,18 @@ For implementation, use `--access workspace-write`, which lets agy edit files in
 
 agy reports success even when it was denied a tool. The helper exits 4 in that case so the caller does not mistake a partial run for a finished one. Use `--model` and `--effort` to pass an explicit choice (`agy models` lists the model slugs, most of which already name an effort level), and `--agy` to select an executable outside `PATH`. `--dry-run` previews the command without starting agy.
 
+## API keys and priority
+
+To continue on a Gemini API key when the plan's quota runs out, store the key at a hidden prompt and list the sources in order.
+
+```bash
+python3 scripts/gemini_api_key.py --profile api1
+mkdir -p "$HOME/.config/delegate-to-antigravity"
+cp examples/plan-then-two-keys.routes.json "$HOME/.config/delegate-to-antigravity/routes.json"
+```
+
+Edit `order` in that file to choose the sequence. Each call starts at the first source, checks that agy uses that credential before sending the task, and moves on only when the plan reports no quota left or a key's credit runs out, resuming the same conversation. See [authentication setup](references/authentication.md).
+
 Keep transcripts private, since they contain task prompts and tool output.
 
 ## Tests
@@ -67,4 +79,4 @@ Keep transcripts private, since they contain task prompts and tool output.
 python3 -m unittest discover -s tests
 ```
 
-The tests use a stand-in `agy` executable that replays simulated events.
+The tests use a stand-in `agy` executable that replays simulated events and a temporary home directory.

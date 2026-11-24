@@ -1,0 +1,8 @@
+{
+  "sources": {
+    "plan": {"type": "subscription"},
+    "api1": {"type": "api", "key_profile": "api1"},
+    "api2": {"type": "api", "key_profile": "api2"}
+  },
+  "order": ["plan", "api1", "api2"]
+}

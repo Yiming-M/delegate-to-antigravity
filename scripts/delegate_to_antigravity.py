@@ -10,10 +10,15 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from antigravity_auth_routes import (AuthSource, api_exhausted, check_auth, load_auth_config, model_family,
+                                     plan_exhausted, quota_error)
 
 # Where Antigravity's installer puts agy when it is not on PATH.
 INSTALLER_BIN = Path.home() / ".local/bin/agy"
@@ -22,6 +27,16 @@ INSTALLER_BIN = Path.home() / ".local/bin/agy"
 # workspace even inside the terminal sandbox, so read-only access denies every
 # tool that can change something.
 READ_ONLY_DENY = ["write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"]
+
+# Used when --auth-config is omitted, so hosts need not know the route file's location.
+DEFAULT_AUTH_CONFIG = Path.home() / ".config/delegate-to-antigravity/routes.json"
+
+CONTINUE_AFTER_QUOTA = (
+    "The previous attempt stopped because its plan quota or API credit was exhausted. "
+    "Continue the existing task using this conversation's instructions and tool history. "
+    "Inspect any partial changes or command results before continuing; do not repeat "
+    "completed or potentially non-idempotent actions. Keep the existing scope and constraints."
+)
 
 
 @dataclass(frozen=True)
@@ -47,15 +62,16 @@ def find_agy(explicit: str | None) -> str | None:
     return str(INSTALLER_BIN) if INSTALLER_BIN.is_file() else None
 
 
-def session_settings(args: argparse.Namespace) -> dict[str, Any] | None:
+def session_settings(args: argparse.Namespace) -> dict[str, Any]:
     if args.access == "read-only":
         return {"permissions": {"deny": READ_ONLY_DENY}}
     if args.allow:
         return {"permissions": {"allow": args.allow}}
-    return None
+    return {}
 
 
-def build_command(args: argparse.Namespace, agy: str, prompt: str) -> list[str]:
+def build_command(args: argparse.Namespace, agy: str, prompt: str,
+                  auth_settings: dict[str, Any] | None = None) -> list[str]:
     command = [
         agy, "--output-format", "stream-json",
         # The prompt is task data: never expand a leading "/" into a slash command or skill.
@@ -63,7 +79,7 @@ def build_command(args: argparse.Namespace, agy: str, prompt: str) -> list[str]:
         # Any shell command that is allowed to run stays in the terminal sandbox.
         "--sandbox",
     ]
-    settings = session_settings(args)
+    settings = {**session_settings(args), **(auth_settings or {})}
     if settings:
         # Applies to this call only; agy never writes it to the user's settings.json.
         command.extend(["--settings", json.dumps(settings)])
@@ -140,10 +156,11 @@ def write_text(path_value: str | None, text: str) -> None:
             stream.write(text)
 
 
-def run_agy(command: list[str], cwd: Path, timeout: int) -> tuple[int, str, str]:
+def run_agy(command: list[str], cwd: Path, timeout: int,
+            env: dict[str, str] | None = None) -> tuple[int, str, str]:
     # A tool command may outlive agy. Terminate the whole process group on timeout.
     with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, text=True, cwd=cwd,
+                          stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
                           start_new_session=True) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -167,6 +184,75 @@ def run_agy(command: list[str], cwd: Path, timeout: int) -> tuple[int, str, str]
             raise
 
 
+def run_ordered_auth(args: argparse.Namespace, agy: str, routes: list[AuthSource], prompt: str,
+                     cwd: Path) -> tuple[int, str, str, list[str], dict[str, Any]]:
+    """Run the call on the first source; move on only when its plan or API credit is used up."""
+    audit: dict[str, Any] = {"requested": [source.name for source in routes], "initial": routes[0].name,
+                             "final": routes[0].name, "fallback": False, "reason": None, "attempts": []}
+    deadline = time.monotonic() + args.timeout
+    attempt_args = copy(args)
+    code, stdout, stderr, command = 1, "", "", []
+    for index, source in enumerate(routes):
+        remaining = max(1, int(deadline - time.monotonic()))
+        try:
+            auth_settings, env = source.launch()
+        except (OSError, ValueError) as exc:
+            audit["reason"] = "api_key_unavailable"
+            return 1, stdout, stderr + f"\nSource {source.name}: {exc}\n", command, audit
+        attempt: dict[str, Any] = {"auth": source.name, "auth_type": source.kind}
+        audit["attempts"].append(attempt)
+        audit.update(final=source.name, fallback=index > 0)
+        try:
+            method, rows = check_auth(agy, auth_settings, env, cwd, min(remaining, 90))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            audit["reason"] = "auth_check_failed"
+            return 1, stdout, stderr + f"\nagy authentication check failed: {exc}\n", command, audit
+        attempt.update(auth_check=method, plan_quota=rows)
+        if method != source.kind:
+            audit["reason"] = "auth_source_mismatch"
+            return 1, stdout, stderr + f"\nSource {source.name} expected {source.kind}, agy uses {method}.\n", \
+                command, audit
+        command = build_command(attempt_args, agy, prompt, auth_settings)
+        remaining = max(1, int(deadline - time.monotonic()))
+        try:
+            code, stdout, stderr = run_agy(command, cwd, remaining, env)
+        except OSError as exc:
+            code, stdout, stderr = 1, "", str(exc)
+        try:
+            parsed = parse_agy_stream(stdout)
+        except ValueError:
+            parsed = None
+        attempt.update(returncode=code, conversation_id=parsed.conversation_id if parsed else None,
+                       status=parsed.status if parsed else None, error=parsed.error if parsed else None)
+        if parsed is None or parsed.status == "SUCCESS" or code == 124 or index + 1 == len(routes):
+            break
+        if source.kind == "subscription" and quota_error(parsed.error):
+            try:
+                _, rows = check_auth(agy, auth_settings, env, cwd, 90)
+            except (OSError, subprocess.TimeoutExpired):
+                rows = []
+            attempt["plan_quota_after"] = rows
+            if not plan_exhausted(rows, args.model):
+                break
+            reason = "subscription_quota_exhausted"
+        elif source.kind == "api" and api_exhausted(parsed.error):
+            reason = "api_credit_exhausted"
+        else:
+            break
+        if routes[index + 1].kind == "api" and model_family(args.model) != "Gemini Models":
+            audit["reason"] = reason + "_model_not_served_by_api"
+            break
+        if not parsed.conversation_id or time.monotonic() >= deadline:
+            audit["reason"] = reason + "_without_resumable_conversation"
+            break
+        audit["reason"] = attempt["fallback_reason"] = reason
+        attempt_args.conversation = parsed.conversation_id
+        prompt = CONTINUE_AFTER_QUOTA
+        print(f"Antigravity billing: {reason}; resuming conversation {parsed.conversation_id} "
+              f"using {routes[index + 1].name}.", file=sys.stderr)
+    return code, stdout, stderr, command, audit
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     prompt_source = parser.add_mutually_exclusive_group()
@@ -177,6 +263,10 @@ def main() -> None:
     parser.add_argument("--model", help="Exact model slug from `agy models`; omit to use agy's default")
     parser.add_argument("--effort", help="Exact reasoning effort; omit to use agy's default")
     parser.add_argument("--conversation", help="Conversation ID returned by an earlier call, to resume it")
+    parser.add_argument("--auth-config", type=Path,
+                        help="JSON authentication sources and priority order "
+                             "(default: ~/.config/delegate-to-antigravity/routes.json when present)")
+    parser.add_argument("--auth-source", help="Use one named source from --auth-config for this call")
     parser.add_argument("--access", choices=["read-only", "workspace-write"], default="read-only",
                         help="read-only (default) denies edits, commands, MCP tools and browser actions")
     parser.add_argument("--allow", action="append", default=[], metavar="RULE",
@@ -208,18 +298,39 @@ def main() -> None:
         parser.error(str(exc))
     if not prompt.strip():
         parser.error("prompt is empty")
+    routes: list[AuthSource] = []
+    if args.auth_config is None and DEFAULT_AUTH_CONFIG.is_file():
+        args.auth_config = DEFAULT_AUTH_CONFIG
+    if args.auth_config:
+        try:
+            sources, order = load_auth_config(args.auth_config.expanduser())
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.auth_source is not None:
+            if args.auth_source not in sources:
+                parser.error("--auth-source must name a configured source")
+            order = [args.auth_source]
+        routes = [sources[name] for name in order]
+    elif args.auth_source is not None:
+        parser.error("--auth-source requires --auth-config")
     command = build_command(args, agy, prompt)
     if args.dry_run:
         print(json.dumps({"cwd": str(cwd), "command": command[:-1] + ["--print=<prompt>"],
+                          "auth": [source.name for source in routes] or "native",
                           "prompt_chars": len(prompt)}, indent=2))
         return
     if not os.access(agy, os.X_OK):
         parser.error(f"agy is missing or not executable: {agy}")
 
-    try:
-        returncode, stdout, stderr = run_agy(command, cwd, args.timeout)
-    except OSError as exc:
-        returncode, stdout, stderr = 1, "", str(exc)
+    if routes:
+        returncode, stdout, stderr, command, auth_audit = run_ordered_auth(args, agy, routes, prompt, cwd)
+    else:
+        try:
+            returncode, stdout, stderr = run_agy(command, cwd, args.timeout)
+        except OSError as exc:
+            returncode, stdout, stderr = 1, "", str(exc)
+        auth_audit = {"requested": "native", "initial": "native", "final": "native",
+                      "fallback": False, "reason": None, "attempts": []}
     parsed = None
     parse_error = None
     try:
@@ -245,7 +356,7 @@ def main() -> None:
     reported_model = parsed.init.get("model") if parsed else None
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "cwd": str(cwd),
-        "command": command[:-1], "prompt": prompt, "conversation_id": conversation_id,
+        "command": command[:-1], "prompt": prompt, "auth_audit": auth_audit, "conversation_id": conversation_id,
         "resumed_from": args.conversation, "access": args.access, "allow": args.allow,
         "requested_model": args.model, "reported_model": reported_model, "requested_effort": args.effort,
         "returncode": exit_code, "agy_returncode": returncode,
@@ -260,6 +371,8 @@ def main() -> None:
     if stderr:
         print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
     usage = parsed.usage if parsed and parsed.usage else {}
+    print(f"Antigravity billing: auth={auth_audit['final']} fallback={auth_audit['fallback']} "
+          f"reason={auth_audit['reason'] or 'none'}", file=sys.stderr)
     print(
         f"Antigravity audit: requested_model={args.model or 'agy default'} "
         f"reported_model={reported_model or 'unknown'} effort={args.effort or 'agy default'} "
@@ -270,8 +383,11 @@ def main() -> None:
     if exit_code:
         if parse_error:
             print(f"error: unable to parse agy stream-json output: {parse_error}", file=sys.stderr)
-        if re.search(r"authentication required", stderr + json.dumps(parsed.error if parsed else None),
-                     re.IGNORECASE):
+        if auth_audit["reason"] == "auth_source_mismatch":
+            print("error: agy did not use the credential this source names; check the sign-in, the key "
+                  "profile (gemini_api_key.py --check) and modelProvider in agy's settings.json.", file=sys.stderr)
+        elif re.search(r"authentication required", stderr + json.dumps(parsed.error if parsed else None),
+                       re.IGNORECASE):
             print("error: agy is not signed in; run `agy` once in a terminal to sign in.", file=sys.stderr)
         if resume_mismatch:
             print(f"error: agy returned conversation {conversation_id} instead of {args.conversation}.",

@@ -31,7 +31,7 @@ directory.
   an effort level, such as `gemini-3.8-flash-low`. Omit both to use agy's own
   default. Do not maintain a hard-coded model menu.
 
-## Sign-in and quota
+## Sign-in, API keys and priority
 
 `agy` uses the Google account it is signed in to, and that account's
 Antigravity plan quota. Headless calls reuse the cached sign-in; they cannot
@@ -39,8 +39,25 @@ sign in. If the helper reports that authentication is required, ask the user to
 run `agy` once in their own terminal and complete the sign-in. Never ask for
 credentials in chat.
 
-When the plan's quota runs out the call fails visibly. The helper does not
-switch accounts, models or billing sources, and you should not work around it.
+Gemini API keys from Google AI Studio are a second billing source. For named
+keys or the order of sources, read
+[authentication setup](references/authentication.md). The helper uses
+`~/.config/delegate-to-antigravity/routes.json` when it exists, otherwise agy's
+own sign-in alone. The user enters keys in their terminal with
+`scripts/gemini_api_key.py`; never ask for a key in chat, read the key files or
+print a key.
+
+Each call starts at the first source in the order. Before sending the task the
+helper checks with `agy -p /usage` that agy really uses that source's
+credential, and stops on a mismatch. It moves to the next source only when the
+plan reports 0% left for the model's family after a quota error, or when an API
+key's prepaid credit, daily quota or spend cap is used up. It then resumes the
+same conversation with a continuation prompt and the same model, effort and
+access, never resending the original task. Temporary rate limits, overload
+(503), authentication failures and timeouts end the call. API keys serve only
+Gemini models, so a Claude or GPT model never moves to one. `--auth-source NAME`
+uses one source. `auth_audit` in the transcript records every attempt. API use
+spends the key's paid balance.
 
 ## Access and permissions
 
@@ -144,7 +161,7 @@ A successful exit does not prove the task is done. Inspect the actual
 artifacts and run relevant checks before accepting an implementation; verify
 consequential factual claims against their sources. Return the useful result,
 any remaining disagreement or blocker, and what you actually verified. Add a
-compact audit from the helper's stderr: requested model and effort, access,
+compact audit from the helper's stderr: billing source and fallback, requested model and effort, access,
 conversation ID, status and token use. agy names a model only when one was
 requested and never reports which model served the call, so mark the served
 model unknown.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -78,7 +79,8 @@ class DelegateToAntigravityTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--agy", str(fake.path), "--cwd", str(self.root),
              "--prompt", "/review this", "--transcript", str(self.transcript), *extra],
-            capture_output=True, text=True, check=False)
+            # A temporary home keeps the user's own route file out of these native-mode tests.
+            env={**os.environ, "HOME": str(self.root)}, capture_output=True, text=True, check=False)
 
     def transcript_data(self) -> dict[str, object]:
         return json.loads(self.transcript.read_text(encoding="utf-8"))
