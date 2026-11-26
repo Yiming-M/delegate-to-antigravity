@@ -103,11 +103,25 @@ calls:
 Start a fresh conversation for an independent task. Capture the returned
 `conversation_id` (in the transcript and on the audit line) and pass
 `--conversation ID` for subsequent feedback, questions, or revisions. Never
-resume "the most recent conversation". Keep the working directory and explicit
-model and effort choices consistent unless the task changes them. Each
-follow-up carries the new instruction and necessary evidence; the agy
-conversation holds the history. If resuming fails or returns a different
-conversation, report it rather than silently starting a replacement.
+resume "the most recent conversation". Each follow-up carries the new
+instruction and necessary evidence; the agy conversation holds the history. If
+resuming fails or returns a different conversation, report it rather than
+silently starting a replacement.
+
+Keep the conversation's prompt cache warm:
+
+- Pass the same explicit `--model` on every call of a conversation. agy does
+  not remember a conversation's model: without `--model` it switches to its own
+  default, and `--effort` alone picks agy's default model at that effort. A
+  different model reads nothing from the cache and agy tells the model about
+  the switch. Change the model only when the task calls for it.
+- Keep `--add-dir` the same on every call; adding or removing a directory
+  also costs a full cache miss.
+- `--access` and `--allow` can change between calls; they do not alter the
+  tools or prompt agy sends.
+- The helper warns before a call whose `--model` differs from the
+  conversation's last model, and after a call that agy served with a different
+  model. Report such a warning; do not retry because of it.
 
 Compose collaboration from ordinary instructions:
 
@@ -161,10 +175,12 @@ A successful exit does not prove the task is done. Inspect the actual
 artifacts and run relevant checks before accepting an implementation; verify
 consequential factual claims against their sources. Return the useful result,
 any remaining disagreement or blocker, and what you actually verified. Add a
-compact audit from the helper's stderr: billing source and fallback, requested model and effort, access,
-conversation ID, status and token use. agy names a model only when one was
-requested and never reports which model served the call, so mark the served
-model unknown.
+compact audit from the helper's stderr: billing source and fallback, requested
+and served model, effort, access, conversation ID, status, token use and any
+drift warning. The helper reads the served model from agy's conversation log
+(`served_models` in the transcript); if it shows `unknown`, say so.
+`first_call_cache_read` shows how much of the conversation the first model call
+read from the prompt cache; an occasional miss is normal.
 
 ## Setup problems
 

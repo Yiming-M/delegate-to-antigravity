@@ -38,20 +38,37 @@ def result_event(response: str = "Done.", *, status: str = "SUCCESS",
         "duration_seconds": 2.5, "num_turns": 1, "usage": {"total_tokens": 42}, **extra}}
 
 
+def conversation_log(home: Path, conversation_id: str = "conv-1") -> Path:
+    return home / ".gemini/antigravity-cli/brain" / conversation_id / ".system_generated/logs/transcript_full.jsonl"
+
+
+def model_calls(*models: str) -> str:
+    # Shape of agy 1.5.15's conversation log entries for model calls.
+    return json_lines(*({"type": "PLANNER_RESPONSE", "model": model, "cache_read_tokens": 0} for model in models))
+
+
 class FakeAgy:
     """An executable that records its arguments, then replays canned output."""
 
-    def __init__(self, root: Path, stdout: str, *, stderr: str = "", code: int = 0) -> None:
+    def __init__(self, root: Path, stdout: str, *, stderr: str = "", code: int = 0,
+                 served: tuple[str, ...] = ()) -> None:
         self.path = root / "agy"
         self.record = root / "record.json"
         (root / "stdout.txt").write_text(stdout, encoding="utf-8")
         (root / "stderr.txt").write_text(stderr, encoding="utf-8")
+        log = conversation_log(root)
         self.path.write_text(textwrap.dedent(f"""\
             #!{sys.executable}
             import json, sys
             from pathlib import Path
             root = Path({str(root)!r})
             Path({str(self.record)!r}).write_text(json.dumps(sys.argv[1:]))
+            served = {model_calls(*served)!r}
+            if served:
+                log = Path({str(log)!r})
+                log.parent.mkdir(parents=True, exist_ok=True)
+                with log.open("a") as stream:
+                    stream.write(served)
             sys.stdout.write((root / "stdout.txt").read_text())
             sys.stderr.write((root / "stderr.txt").read_text())
             sys.exit({code})
@@ -125,6 +142,45 @@ class DelegateToAntigravityTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertIn("instead of conv-1", completed.stderr)
         self.assertEqual(option(fake.argv(), "--conversation"), "conv-1")
+
+    def resume_from(self, *models: str) -> None:
+        log = conversation_log(self.root)
+        log.parent.mkdir(parents=True)
+        log.write_text(model_calls(*models), encoding="utf-8")
+
+    def test_resume_warns_before_a_model_change(self) -> None:
+        self.resume_from("gemini-3.8-flash-low")
+        fake = FakeAgy(self.root, json_lines(result_event()), served=("gemini-3.8-flash-medium",))
+        completed = self.run_helper(fake, "--conversation", "conv-1", "--model", "gemini-3.8-flash-medium")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr.count("warning: resumed conversation drift"), 1)
+        self.assertIn("differs from the conversation's model 'gemini-3.8-flash-low'", completed.stderr)
+        data = self.transcript_data()
+        self.assertEqual(data["served_models"], ["gemini-3.8-flash-medium"])
+        self.assertEqual(data["prior_model"], "gemini-3.8-flash-low")
+
+    def test_resume_without_model_reports_agy_default_switch(self) -> None:
+        self.resume_from("gemini-3.8-flash-low", "gemini-3.8-flash-low")
+        fake = FakeAgy(self.root, json_lines(result_event()), served=("gemini-4-neon-high", "gemini-4-neon-high"))
+        completed = self.run_helper(fake, "--conversation", "conv-1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("agy served gemini-4-neon-high instead of the conversation's model", completed.stderr)
+        self.assertIn("served_model=gemini-4-neon-high ", completed.stderr)
+        self.assertEqual(len(self.transcript_data()["resume_warnings"]), 1)
+
+    def test_resume_with_same_model_reports_served_model_and_cache_without_warning(self) -> None:
+        self.resume_from("gemini-3.8-flash-low")
+        usage = {"input_tokens": 2267, "cache_read_tokens": 9885}
+        fake = FakeAgy(self.root, json_lines(
+            {"event": "step_update", "step_update": {"step_type": "agent_response", "state": "DONE", "usage": usage}},
+            result_event()), served=("gemini-3.8-flash-low",))
+        completed = self.run_helper(fake, "--conversation", "conv-1", "--model", "gemini-3.8-flash-low",
+                                    "--access", "workspace-write", "--allow", "command(pytest -q)")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("warning", completed.stderr)
+        self.assertIn("served_model=gemini-3.8-flash-low ", completed.stderr)
+        self.assertIn("first_call_cache_read=9885", completed.stderr)
+        self.assertEqual(self.transcript_data()["first_call_usage"], usage)
 
     def test_denied_actions_exit_4_although_agy_reports_success(self) -> None:
         fake = FakeAgy(self.root, json_lines(result_event(

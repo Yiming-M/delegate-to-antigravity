@@ -28,6 +28,9 @@ INSTALLER_BIN = Path.home() / ".local/bin/agy"
 # tool that can change something.
 READ_ONLY_DENY = ["write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"]
 
+# agy logs every model call of a conversation here, including the model that served it.
+AGY_BRAIN = Path.home() / ".gemini/antigravity-cli/brain"
+
 # Used when --auth-config is omitted, so hosts need not know the route file's location.
 DEFAULT_AUTH_CONFIG = Path.home() / ".config/delegate-to-antigravity/routes.json"
 
@@ -51,6 +54,7 @@ class ParsedAgyOutput:
     duration_seconds: float | None
     tool_activity: list[dict[str, Any]]
     denials: list[Any]
+    first_call_usage: dict[str, Any] | None
 
 
 def find_agy(explicit: str | None) -> str | None:
@@ -60,6 +64,21 @@ def find_agy(explicit: str | None) -> str | None:
     if candidate:
         return candidate
     return str(INSTALLER_BIN) if INSTALLER_BIN.is_file() else None
+
+
+def conversation_models(conversation_id: str | None) -> list[str] | None:
+    """Models of the conversation's model calls in order, from agy's log; None when unreadable."""
+    if not conversation_id:
+        return []
+    path = AGY_BRAIN / conversation_id / ".system_generated/logs/transcript_full.jsonl"
+    if not path.is_file():
+        return []
+    try:
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return None
+    return [event["model"] for event in events if isinstance(event, dict)
+            and event.get("type") == "PLANNER_RESPONSE" and isinstance(event.get("model"), str)]
 
 
 def session_settings(args: argparse.Namespace) -> dict[str, Any]:
@@ -131,6 +150,10 @@ def parse_agy_stream(stdout: str) -> ParsedAgyOutput:
     denials: list[Any] = list(result.get("denied_actions") or [])
     denials += [tool for tool in tool_activity if tool["state"] == "ERROR"
                 and "permission check failed" in json.dumps(tool.get("error"))]
+    # The first model call shows whether the resumed conversation prefix was read from the prompt cache.
+    first_call_usage = next((event["step_update"]["usage"] for event in events
+                             if event.get("event") == "step_update" and isinstance(event.get("step_update"), dict)
+                             and isinstance(event["step_update"].get("usage"), dict)), None)
     return ParsedAgyOutput(
         init=init_event.get("init") if isinstance(init_event.get("init"), dict) else {},
         conversation_id=result.get("conversation_id") or init_event.get("conversation_id") or None,
@@ -142,6 +165,7 @@ def parse_agy_stream(stdout: str) -> ParsedAgyOutput:
         duration_seconds=result.get("duration_seconds"),
         tool_activity=tool_activity,
         denials=denials,
+        first_call_usage=first_call_usage,
     )
 
 
@@ -314,13 +338,24 @@ def main() -> None:
     elif args.auth_source is not None:
         parser.error("--auth-source requires --auth-config")
     command = build_command(args, agy, prompt)
+    # agy does not keep a conversation's model: an omitted --model uses agy's default, and any
+    # model change costs a full prompt-cache miss.
+    prior_models = conversation_models(args.conversation)
+    prior_model = prior_models[-1] if prior_models else None
+    resume_warnings = []
+    if prior_model and args.model is not None and args.model != prior_model:
+        resume_warnings.append(f"--model {args.model!r} differs from the conversation's model {prior_model!r}")
     if args.dry_run:
         print(json.dumps({"cwd": str(cwd), "command": command[:-1] + ["--print=<prompt>"],
                           "auth": [source.name for source in routes] or "native",
+                          "resume_warnings": resume_warnings,
                           "prompt_chars": len(prompt)}, indent=2))
         return
     if not os.access(agy, os.X_OK):
         parser.error(f"agy is missing or not executable: {agy}")
+    for warning in resume_warnings:
+        print(f"warning: resumed conversation drift: {warning}. Keep --model the same on every "
+              "--conversation call, or start a fresh conversation, to avoid prompt cache misses.", file=sys.stderr)
 
     if routes:
         returncode, stdout, stderr, command, auth_audit = run_ordered_auth(args, agy, routes, prompt, cwd)
@@ -352,17 +387,28 @@ def main() -> None:
     else:
         exit_code = 0
 
-    # agy names the model only when one is requested, and never reports the served model.
+    # agy's stream names the model only when one is requested; its conversation log names the served one.
     reported_model = parsed.init.get("model") if parsed else None
+    after_models = conversation_models(conversation_id)
+    served_models = None
+    if after_models is not None and prior_models is not None:
+        start = len(prior_models) if conversation_id == args.conversation else 0
+        served_models = list(dict.fromkeys(after_models[start:]))
+    if prior_model and served_models and served_models != [prior_model] and not resume_warnings:
+        resume_warnings.append(f"agy served {', '.join(served_models)} instead of the conversation's model "
+                               f"{prior_model!r}; pass the same explicit --model on every --conversation call")
+        print(f"warning: resumed conversation drift: {resume_warnings[-1]}.", file=sys.stderr)
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "cwd": str(cwd),
         "command": command[:-1], "prompt": prompt, "auth_audit": auth_audit, "conversation_id": conversation_id,
         "resumed_from": args.conversation, "access": args.access, "allow": args.allow,
-        "requested_model": args.model, "reported_model": reported_model, "requested_effort": args.effort,
+        "requested_model": args.model, "reported_model": reported_model, "served_models": served_models,
+        "prior_model": prior_model, "resume_warnings": resume_warnings, "requested_effort": args.effort,
         "returncode": exit_code, "agy_returncode": returncode,
         "status": parsed.status if parsed else None, "response": parsed.response if parsed else None,
         "error": parsed.error if parsed else None, "denials": parsed.denials if parsed else [],
         "usage": parsed.usage if parsed else None, "num_turns": parsed.num_turns if parsed else None,
+        "first_call_usage": parsed.first_call_usage if parsed else None,
         "duration_seconds": parsed.duration_seconds if parsed else None,
         "tool_activity": parsed.tool_activity if parsed else [],
         "stderr": stderr, "parse_error": parse_error, "raw_stdout": stdout,
@@ -371,14 +417,16 @@ def main() -> None:
     if stderr:
         print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
     usage = parsed.usage if parsed and parsed.usage else {}
+    first_call = parsed.first_call_usage if parsed and parsed.first_call_usage else {}
     print(f"Antigravity billing: auth={auth_audit['final']} fallback={auth_audit['fallback']} "
           f"reason={auth_audit['reason'] or 'none'}", file=sys.stderr)
     print(
         f"Antigravity audit: requested_model={args.model or 'agy default'} "
-        f"reported_model={reported_model or 'unknown'} effort={args.effort or 'agy default'} "
+        f"served_model={','.join(served_models or []) or 'unknown'} effort={args.effort or 'agy default'} "
         f"access={args.access} conversation={conversation_id or 'unknown'} "
         f"status={parsed.status if parsed else 'unknown'} turns={parsed.num_turns if parsed else 'unknown'} "
-        f"tokens={usage.get('total_tokens', 'unknown')}", file=sys.stderr,
+        f"tokens={usage.get('total_tokens', 'unknown')} "
+        f"first_call_cache_read={first_call.get('cache_read_tokens', 'unknown')}", file=sys.stderr,
     )
     if exit_code:
         if parse_error:
